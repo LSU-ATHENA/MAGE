@@ -28,7 +28,7 @@ parser.add_argument('--hidden_channels', type=int, default=64, help='Number of h
 parser.add_argument('--output_channels', type=int, default=2, help='Number of output channels')
 parser.add_argument('--target_model', type=str, default='checkpoints/models/Mutagenicity_model.pth', help='Path to the pretrained GNN model')
 parser.add_argument('--dataset', type=str, default='checkpoints/datasets/Mutagenicity.pt', help='Path to the dataset')
-parser.add_argument('--label', type=int, default=0, help='Label of the data')
+parser.add_argument('--label', type=int, default=1, help='Label of the data')
 
 
 
@@ -47,15 +47,6 @@ model.eval()
 
 # Load the dataset from checkpoints
 dataset = torch.load(args.dataset)
-
-#==============================================
-print(type(dataset))
-print(dataset[0])
-
-from graph_SMILES import draw_molecule, pyg_to_mol
-
-#draw_molecule(dataset[5], title="chem from dataset")
-#==============================================
 
 
 new_dataset = []
@@ -111,29 +102,25 @@ with open(prob_path, 'w') as f:
         f.write(f'{data}\n')
 
 
-from graph_SMILES import smiles_to_graph
+from graph_draw import smiles_to_graph
 
 graphs = []
 index = 0
 for data in sampled_data:
     graph = smiles_to_graph(data)
+    #print(graph.nodes(data=True))
+    #print(graph.edges(data=True))
     graphs.append(graph)
 
     if graph is None:
         continue
 
-    graphs_path = f"sampled_data/graphs/{args.data_name}_label_{args.label}_graph_{index}.png"
+    graph_path = f"sampled_data/graphs/{args.data_name}_label_{args.label}_graph_{index}.png"
 
-    os.makedirs(os.path.dirname(graphs_path), exist_ok=True)
-
-    # draw graph
-    pos = nx.spring_layout(graph)
-    labels = nx.get_node_attributes(graph, "label")
-
-    nx.draw(graph, pos, with_labels=True, labels=labels, node_size=500)
+    os.makedirs(os.path.dirname(graph_path), exist_ok=True)
 
     # save image
-    plt.savefig(graphs_path, bbox_inches="tight")
+    plt.savefig(graph_path, bbox_inches="tight")
     plt.close()
 
     index +=1
