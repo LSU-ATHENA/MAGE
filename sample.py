@@ -36,7 +36,7 @@ model.load_state_dict(torch.load(args.target_model))
 model.eval()
 
 # Load the dataset from checkpoints
-dataset = torch.load(args.dataset)
+dataset = torch.load(args.dataset, weights_only=False)
 
 new_dataset = []
 count = 0
