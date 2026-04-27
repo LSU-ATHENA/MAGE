@@ -1,11 +1,22 @@
-
-from rdkit import Chem
-from rdkit.Chem import Recap
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Recap
+    HAS_RDKIT = True
+except ImportError:
+    Chem = None
+    Recap = None
+    HAS_RDKIT = False
 from tqdm import tqdm
 from collections import defaultdict
 from utils.utils import sanitize_mol, sanitize_smiles, get_mol, get_smiles
 
+
+def _require_rdkit():
+    if not HAS_RDKIT:
+        raise ImportError("utils.bridge requires RDKit for molecular fragmentation.")
+
 def get_bridge_bonds(mol):
+    _require_rdkit()
     bridge_bonds = []
     for bond in mol.GetBonds():
         u, v = bond.GetBeginAtom(), bond.GetEndAtom()
@@ -19,6 +30,7 @@ def get_bridge_bonds(mol):
     return bridge_bonds
 
 def break_bonds(mol, bond_indices):
+    _require_rdkit()
     emol = Chem.EditableMol(mol)
     breaked_bonds = []
     # Remove bonds based on indices
@@ -38,6 +50,7 @@ def break_bonds(mol, bond_indices):
     return fragments, atom_indices, breaked_bonds
 
 def bridge(data):
+    _require_rdkit()
     motif_dict = defaultdict(list)
     motif_id = {}
     mol = get_mol(data, False)
@@ -48,6 +61,7 @@ def bridge(data):
     return mol, fragments, atom_list, bond_list
 
 def bridge_list(data_list):
+    _require_rdkit()
     tf = []
     df = defaultdict(int)
     motif_list = []
@@ -73,6 +87,7 @@ def bridge_list(data_list):
     return motif_list, df
 
 def do_bridge(data):
+    _require_rdkit()
     mol = get_mol(data, False)
     num_atoms = mol.GetNumAtoms()
     bridge_bonds = get_bridge_bonds(mol)

@@ -4,15 +4,33 @@ import torch
 import torch.nn.functional as F
 import torch_geometric
 from torch_geometric.data import Data
-from rdkit import Chem
-from rdkit.Chem import rdchem
-from rdkit.Chem import rdmolops
-from rdkit import RDLogger
 from typing import Any
 from utils.mapping_conf import ATOM, EDGE
 from tqdm import tqdm
 
+try:
+    from rdkit import Chem
+    from rdkit.Chem import rdchem
+    from rdkit.Chem import rdmolops
+    from rdkit import RDLogger
+    HAS_RDKIT = True
+except ImportError:
+    Chem = None
+    rdchem = None
+    rdmolops = None
+    RDLogger = None
+    HAS_RDKIT = False
+
+
+def _require_rdkit():
+    if not HAS_RDKIT:
+        raise ImportError(
+            "This function requires RDKit, but RDKit is not installed. "
+            "Use graph-native paths (e.g. new_mage.py + utils/tree.py) for generic PyG datasets."
+        )
+
 def clean_dataset(dataset, data_name, add_H = False):
+    _require_rdkit()
     cleaned_data_0 = []
     cleaned_data_1 = []
     id_0 = []
@@ -34,9 +52,11 @@ def clean_dataset(dataset, data_name, add_H = False):
     return cleaned_data_0, cleaned_data_1, (id_0, id_1)
 
 def kekulize_mol(mol):
+    _require_rdkit()
     Chem.Kekulize(mol)
 
 def get_mol(smiles, addH=False):
+    _require_rdkit()
     RDLogger.DisableLog('rdApp.*')  
     mol = Chem.MolFromSmiles(smiles)
     if addH == True:
@@ -45,11 +65,13 @@ def get_mol(smiles, addH=False):
     return mol
 
 def get_smiles(mol):
+    _require_rdkit()
     RDLogger.DisableLog('rdApp.*') 
     smiles = Chem.MolToSmiles(mol)
     return smiles
 
 def sanitize_mol(mol, addH=False):
+    _require_rdkit()
     try:
         mol = get_mol(get_smiles(mol), addH=addH)
     except:
@@ -57,6 +79,7 @@ def sanitize_mol(mol, addH=False):
     return mol
     
 def sanitize_smiles(smiles, addH=False):
+    _require_rdkit()
     try:
         mol = get_mol(smiles, addH=addH)
         smiles = get_smiles(mol)
@@ -67,6 +90,7 @@ def sanitize_smiles(smiles, addH=False):
 
 # Function to find potential bonding sites
 def find_bonding_sites(mol):
+    _require_rdkit()
     bonding_sites = []
     for atom in mol.GetAtoms():
         # Check if the atom has free valence
@@ -75,6 +99,7 @@ def find_bonding_sites(mol):
     return bonding_sites
 
 def check_bond_feasibility(mol1, mol2, site1, site2):
+    _require_rdkit()
     # Temporary combining of fragments for checking
     combined_mol = Chem.CombineMols(mol1, mol2)
     editable_mol = Chem.EditableMol(combined_mol)
@@ -93,6 +118,7 @@ def check_bond_feasibility(mol1, mol2, site1, site2):
     return True
 
 def can_assemble(mol, fragment):
+    _require_rdkit()
     # Get bonding sites for each fragment
     sites1 = find_bonding_sites(mol)
     sites2 = find_bonding_sites(fragment)
@@ -117,6 +143,7 @@ def to_smiles(data: 'torch_geometric.data.Data',
         data_name: The name of dataset
     """
 
+    _require_rdkit()
     mol = Chem.RWMol()
 
     for i in range(data.num_nodes):
@@ -156,6 +183,7 @@ def to_smiles(data: 'torch_geometric.data.Data',
     return sanitize_smiles(get_smiles(mol), add_H)
 
 def to_tudataset(mol, data_name, label=None):
+    _require_rdkit()
     if mol == None:
         return None
     if mol.GetNumAtoms() == 0 and mol.GetNumBonds() == 0:

@@ -5,7 +5,6 @@ import torch.nn as nn
 from torch.nn import Linear
 import torch.nn.functional as F
 from utils.model import GCN
-from utils.utils import sanitize_smiles, to_smiles
 from torch_geometric.data import DataLoader
 from new_mage import MAGE
 import argparse
@@ -52,15 +51,9 @@ dataset = torch.load(args.dataset, weights_only=False)
 new_dataset = []
 count = 0
 prob = 0
-smiles_set = []
 for data in dataset:
     batch = torch.zeros(data.num_nodes, dtype=torch.long).to(device)
     pred = model(data.x.to(device), data.edge_index.to(device), batch=batch)
-    smiles = to_smiles(data, data_name=args.data_name)
-    smiles = sanitize_smiles(smiles)
-    if not smiles:
-        continue
-    smiles_set.append(smiles)
     if pred.argmax().item() == args.label:
         if pred.softmax(1)[0][args.label].item() > 0.9:
             new_dataset.append(data)
@@ -68,7 +61,7 @@ for data in dataset:
             prob += pred.softmax(1)[0][args.label].item()
 
 # Initialize the Mage class
-mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=smiles_set, data_name=args.data_name, add_H=False, label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
+mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=None, data_name=args.data_name, add_H=False, label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
 
 path_dict = {
     'T_encoder': f'checkpoints/models/{args.data_name}_label_{args.label}_T_encoder.pth', 
@@ -87,45 +80,17 @@ mean = np.mean(pred_prob)
 std = np.std(pred_prob)
 
 #============================================================================
-SMILES_path = f'sampled_data/{args.data_name}_label_{args.label}_SMILES.txt'
-os.makedirs(os.path.dirname(SMILES_path), exist_ok=True)
-
-with open(SMILES_path, 'w') as f:
-    for data in sampled_data:
-        f.write(f'{data}\n')
+graph_path = f'sampled_data/{args.data_name}_label_{args.label}_graphs.pt'
+os.makedirs(os.path.dirname(graph_path), exist_ok=True)
+torch.save(sampled_data, graph_path)
 
 prob_path = f'sampled_data/{args.data_name}_label_{args.label}_prob.txt'
-os.makedirs(os.path.dirname(SMILES_path), exist_ok= True)
+os.makedirs(os.path.dirname(prob_path), exist_ok=True)
 
 with open(prob_path, 'w') as f:
     for data in pred_prob:
         f.write(f'{data}\n')
 
-
-from graph_draw import smiles_to_graph
-
-graphs = []
-index = 0
-for data in sampled_data:
-    graph = smiles_to_graph(data)
-    #print(graph.nodes(data=True))
-    #print(graph.edges(data=True))
-    graphs.append(graph)
-
-    if graph is None:
-        continue
-
-    graph_path = f"sampled_data/graphs/{args.data_name}_label_{args.label}_graph_{index}.png"
-
-    os.makedirs(os.path.dirname(graph_path), exist_ok=True)
-
-    # save image
-    plt.savefig(graph_path, bbox_inches="tight")
-    plt.close()
-
-    index +=1
-
-    if index == 20:
-        break
+# Optional plotting can be added later via a generic Data->networkx renderer.
 
 #============================================================================================

@@ -8,7 +8,6 @@ from utils.model import GCN
 from torch_geometric.data import DataLoader
 from new_mage import MAGE
 import argparse
-from utils.utils import sanitize_smiles, to_smiles
 
 
 # Create an argument parser
@@ -46,15 +45,9 @@ print(len(dataset))
 count = 0
 prob = 0
 new_dataset = []
-smiles_set = []
 for data in dataset:
     batch = torch.zeros(data.num_nodes, dtype=torch.long).to(device)
     pred = model(data.x.to(device), data.edge_index.to(device), batch=batch)
-    smiles = to_smiles(data, data_name=args.data_name)
-    smiles = sanitize_smiles(smiles)
-    if not smiles:
-        print(stop)
-    smiles_set.append(smiles)
     if pred.softmax(1)[0][args.label].item() > 0.9:
         new_dataset.append(data)
         count += 1
@@ -67,6 +60,6 @@ print(len(new_dataset))
 print(f"Label: {args.label}")
 
 # Initialize the Mage class
-mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=smiles_set, data_name=args.data_name, add_H=False, label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
+mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=None, data_name=args.data_name, add_H=False, label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
 
 mage.train_t_encoder(epochs=300, lr=0.0001, batch_size=32, save_path=f'checkpoints/models/{args.data_name}_label_{args.label}_T_encoder.pth')

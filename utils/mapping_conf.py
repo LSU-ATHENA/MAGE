@@ -1,5 +1,17 @@
 
-from rdkit.Chem import rdchem
+try:
+    from rdkit.Chem import rdchem
+except ImportError:
+    class _BondTypeFallback:
+        AROMATIC = "AROMATIC"
+        SINGLE = "SINGLE"
+        DOUBLE = "DOUBLE"
+        TRIPLE = "TRIPLE"
+
+    class _RdchemFallback:
+        BondType = _BondTypeFallback
+
+    rdchem = _RdchemFallback()
 
 ATOM = {
     'MUTAG': {

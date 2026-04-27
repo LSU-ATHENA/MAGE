@@ -19,8 +19,12 @@ from torch_geometric.data import Data, Batch
 import numpy as np
 from collections import defaultdict, deque
 from tqdm import tqdm
-from rdkit import Chem
-from rdkit.Chem import rdmolops
+try:
+    from rdkit import Chem
+    from rdkit.Chem import rdmolops
+except ImportError:
+    Chem = None
+    rdmolops = None
 from sklearn.model_selection import train_test_split
 
 class MAGE:

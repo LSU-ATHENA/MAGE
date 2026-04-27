@@ -1,7 +1,13 @@
 import networkx as nx
 
-from rdkit import Chem
-from rdkit.Chem import rdchem
+try:
+    from rdkit import Chem
+    from rdkit.Chem import rdchem
+    HAS_RDKIT = True
+except ImportError:
+    Chem = None
+    rdchem = None
+    HAS_RDKIT = False
 
 # mapping file
 from utils.mapping_conf import ATOM, EDGE
@@ -20,6 +26,8 @@ NODE_COLOR = {
 
 
 def smiles_to_graph(smiles):
+    if not HAS_RDKIT:
+        return None
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
@@ -59,6 +67,8 @@ def smiles_to_graph(smiles):
     return G
 
 def atomic_num_to_symbol(num):
+    if not HAS_RDKIT:
+        return str(num)
     return Chem.PeriodicTable.GetElementSymbol(
         Chem.GetPeriodicTable(), num
     )
@@ -66,7 +76,9 @@ def decode_atom(dataset_name, feat_idx):
     atomic_num = ATOM[dataset_name][feat_idx]
     return atomic_num_to_symbol(atomic_num)
 def decode_bond(dataset_name, edge_idx):
-    return EDGE[dataset_name].get(edge_idx, rdchem.BondType.SINGLE)
+    if HAS_RDKIT:
+        return EDGE[dataset_name].get(edge_idx, rdchem.BondType.SINGLE)
+    return EDGE[dataset_name].get(edge_idx, "SINGLE")
 
 def pyg_to_nx(data, dataset_name="Mutagenicity"):
 

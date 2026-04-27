@@ -13,29 +13,40 @@ from torch.nn import Linear
 import torch.nn.functional as F
 from utils.model import TGCN
 from utils.tree import Tree, TreeDataset
-from utils.utils import to_tudataset, get_mol, sanitize_mol, get_smiles, sanitize_smiles, can_assemble
 from utils.loader import custom_collate, DataLoader
 from utils.motif_filter import motif_filter
 from torch_geometric.data import Data, Batch
 import numpy as np
 from collections import defaultdict, deque
 from tqdm import tqdm
-from rdkit import Chem
-from rdkit.Chem import rdmolops
 from sklearn.model_selection import train_test_split
 import os
 
 class MAGE:
-    def __init__(self, gnn, model, dataset, whole_dataset, smiles_set, data_name, add_H, hidden_channels, output_channels, label, device):
+    def __init__(
+        self,
+        gnn,
+        model,
+        dataset,
+        whole_dataset,
+        smiles_set,
+        data_name,
+        add_H,
+        hidden_channels,
+        output_channels,
+        label,
+        device,
+    ):
         self.gnn = gnn
         self.dataset = dataset
-        self.whole_dataset= whole_dataset
-        self.smiles_set = smiles_set
+        self.whole_dataset = whole_dataset
+        self.smiles_set = smiles_set  # optional; only used for molecular motif_filter
         self.data_name = data_name
         self.add_H = add_H
         self.label = label
         self.motif_id = {}
         self.id_motif = {}
+        self.motif_data = {}  # maps motif key -> PyG Data (subgraph with local node indices)
         self.device = device
         self.hidden_channels = hidden_channels
         self.model = model.to(self.device) # Pretrained target GNN model as the graph encoder
@@ -71,7 +82,7 @@ class MAGE:
     
     def get_tree(self, data, test=False):
         # Get the tree from the dataset
-        tree = Tree(data, self.data_name, self.add_H)
+        tree = Tree(data, self.data_name)
         tree.transform()
         node_motif_map = defaultdict(set)
         node_indices = []
@@ -82,6 +93,28 @@ class MAGE:
                     return None
                 self.motif_id[motif] = len(self.motif_id)
                 self.id_motif[self.motif_id[motif]] = motif
+                # Cache the subgraph Data for this motif
+                idx_list = list(tree.atom_list[i])
+                idx_set = set(idx_list)
+                local_map = {orig: local for local, orig in enumerate(idx_list)}
+                sub_x = data.x[idx_list]
+                if data.edge_index.size(1) > 0:
+                    keep = [
+                        j for j in range(data.edge_index.size(1))
+                        if data.edge_index[0, j].item() in idx_set
+                        and data.edge_index[1, j].item() in idx_set
+                    ]
+                    if keep:
+                        sub_ei_raw = data.edge_index[:, keep]
+                        sub_ei = torch.stack([
+                            torch.tensor([local_map[n.item()] for n in sub_ei_raw[0]], dtype=torch.long),
+                            torch.tensor([local_map[n.item()] for n in sub_ei_raw[1]], dtype=torch.long),
+                        ])
+                    else:
+                        sub_ei = torch.empty((2, 0), dtype=torch.long)
+                else:
+                    sub_ei = torch.empty((2, 0), dtype=torch.long)
+                self.motif_data[motif] = Data(x=sub_x, edge_index=sub_ei)
             for node in tree.atom_list[i]:
                 node_motif_map[node].add(i)
         # Create x for the tree, each node is a motif, the node feature is the motif id
@@ -116,11 +149,9 @@ class MAGE:
         self.model.eval()
         with torch.no_grad():
             for motif in tqdm(self.motif_id.keys()):
-                mol = sanitize_mol(get_mol(motif, self.data_name), self.add_H)
-                data = to_tudataset(mol, self.data_name)
-                data.to(self.device)
-                batch = torch.zeros(data.num_nodes, dtype=torch.long).to(self.device)
-                motif_embedding = self.model(data.x, data.edge_index, batch, return_embedding=True)
+                motif_graph = self.motif_data[motif].to(self.device)
+                batch = torch.zeros(motif_graph.num_nodes, dtype=torch.long).to(self.device)
+                motif_embedding = self.model(motif_graph.x, motif_graph.edge_index, batch, return_embedding=True)
                 self.motif_embedding.append(motif_embedding)
                 
         self.motif_embedding = torch.stack(self.motif_embedding).squeeze().to(self.device)
@@ -220,8 +251,8 @@ class MAGE:
             total_acc_correct += acc_correct
             total_acc_wrong += acc_wrong
 
-            smiles, pred_prob, graph_embedding = self.decode_graph(new_tree)
-            if smiles:
+            graph_repr, pred_prob, graph_embedding = self.decode_graph(new_tree)
+            if graph_repr is not None:
                 batch = torch.zeros(new_tree.x.size(0), dtype=torch.long).to(self.device)
                 # with torch.no_grad():
                 tree_emb = self.T_encoder(self.motif_embedding[new_tree.x.view(-1)], new_tree.edge_index, batch=batch, return_embedding=True)
@@ -265,8 +296,6 @@ class MAGE:
                         softmax_label = self.straight_through_gumbel_softmax(label_pred, temperature=0.1)
                     if node[0] == -1:
                         curr_x = torch.cat((curr_x, softmax_label), dim=0)
-                        motif = self.id_motif[curr_x[-1].argmax().item()]
-                        curr_mol = sanitize_mol(get_mol(motif, self.data_name), self.add_H)
                         batch = torch.zeros(curr_x.shape[0], dtype=torch.long).to(self.device)
                         with torch.no_grad():
                             tree_emb = self.T_encoder(torch.matmul(curr_x, self.motif_embedding), curr_edge_index, curr_edge_weight, batch=batch, return_embedding=True)
@@ -274,36 +303,22 @@ class MAGE:
                         tree_pred_loss += self.criterion(pred, torch.tensor([self.label], device=self.device))
                     else:
                         if test:
-                            values, indices = torch.topk(label_pred, 5)
-                            # values, indices = torch.topk(softmax_label, 20)
-                            selected_motif = None
-                            for i in range(len(indices[0])):
-                                motif = self.id_motif[indices[0][i].item()]
-                                mol = sanitize_mol(get_mol(motif, self.data_name), self.add_H)
-                                site_pair = can_assemble(curr_mol, mol)
-                                if site_pair:
-                                    new_x = torch.nn.functional.one_hot(indices[0][i].view(-1), num_classes=len(self.id_motif))
-                                    curr_x = torch.cat((curr_x, new_x), dim=0)
-                                    curr_mol = mol
-                                    selected_motif = motif
-                                    curr_edge_index = torch.cat((curr_edge_index, torch.tensor([[node[0], node[1]], [node[1], node[0]]], dtype=torch.long, device=self.device)), dim=1)
-                                    topo_prob = topo_pred.softmax(1)[0,1]
-                                    edge_weight = self.gumbel_softmax_edge_weight(topo_prob)
-                                    curr_edge_weight = torch.cat((curr_edge_weight, edge_weight.view(-1)), dim=0)
-                                    curr_edge_weight = torch.cat((curr_edge_weight, edge_weight.view(-1)), dim=0)
-                                    batch = torch.zeros(curr_x.shape[0], dtype=torch.long).to(self.device)
-                                    with torch.no_grad():
-                                        tree_emb = self.T_encoder(torch.matmul(curr_x, self.motif_embedding), curr_edge_index, batch=batch, return_embedding=True)
-                                    pred = self.model(tree_emb, classifier=True)
-                                    tree_pred_loss += self.criterion(pred, torch.tensor([self.label], device=self.device))
-                                    break
+                            # Pick the single highest-scoring motif (no valence constraints for generic graphs)
+                            top_idx = torch.argmax(label_pred, dim=1)
+                            new_x = torch.nn.functional.one_hot(top_idx.view(-1), num_classes=len(self.id_motif)).float()
+                            curr_x = torch.cat((curr_x, new_x), dim=0)
+                            curr_edge_index = torch.cat((curr_edge_index, torch.tensor([[node[0], node[1]], [node[1], node[0]]], dtype=torch.long, device=self.device)), dim=1)
+                            topo_prob = topo_pred.softmax(1)[0, 1]
+                            edge_weight = self.gumbel_softmax_edge_weight(topo_prob)
+                            curr_edge_weight = torch.cat((curr_edge_weight, edge_weight.view(-1)), dim=0)
+                            curr_edge_weight = torch.cat((curr_edge_weight, edge_weight.view(-1)), dim=0)
+                            batch = torch.zeros(curr_x.shape[0], dtype=torch.long).to(self.device)
+                            with torch.no_grad():
+                                tree_emb = self.T_encoder(torch.matmul(curr_x, self.motif_embedding), curr_edge_index, batch=batch, return_embedding=True)
+                            pred = self.model(tree_emb, classifier=True)
+                            tree_pred_loss += self.criterion(pred, torch.tensor([self.label], device=self.device))
                         else:
-                            motif = self.id_motif[softmax_label.argmax().item()]
-                            mol = sanitize_mol(get_mol(motif, self.data_name), self.add_H)
-                            # site_pair = can_assemble(curr_mol, mol)
-                            # if site_pair:
                             curr_x = torch.cat((curr_x, softmax_label), dim=0)
-                            curr_mol = mol
                             curr_edge_index = torch.cat((curr_edge_index, torch.tensor([[node[0], node[1]], [node[1], node[0]]], dtype=torch.long, device=self.device)), dim=1)
                             topo_prob = topo_pred.softmax(1)[0,1]
                             edge_weight = self.gumbel_softmax_edge_weight(topo_prob)
@@ -353,112 +368,102 @@ class MAGE:
         return G_emb
 
     def decode_graph(self, tree):
+        """Reconstruct a graph from a motif tree by greedily combining cached
+        motif subgraphs.  Returns (graph_data | None, pred_prob, embedding | None).
+        graph_data is a PyG Data object; None signals a failed decode."""
         queue = deque([])
-
         for i in range(0, tree.edge_index.shape[1], 2):
-        # for i in range(tree.edge_index.shape[1]-1, -1, -2):
             queue.append((tree.edge_index[0, i].item(), tree.edge_index[1, i].item()))
-        curr_mol = None
+
+        curr_graph = None
+        node_motif_mapping = {}  # node index in curr_graph -> tree-node index
         visited = set()
-        bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE]
+
         if not queue:
+            # Single-motif tree
             motif = self.id_motif[tree.x[0].item()]
-            smiles = sanitize_smiles(motif, self.add_H)
-            mol = sanitize_mol(get_mol(smiles, self.data_name), self.add_H)
-            data = to_tudataset(mol, self.data_name)
-            data.to(self.device)
-            batch = torch.zeros(data.num_nodes, dtype=torch.long).to(self.device)
-            pred = self.model(data.x, data.edge_index, batch)
-            pred = F.softmax(pred, dim=1)
-            embedding = self.model(data.x, data.edge_index, batch, return_embedding=True)
-            return smiles, pred[0, self.label].item(), embedding
+            motif_graph = self.motif_data[motif].to(self.device)
+            batch = torch.zeros(motif_graph.num_nodes, dtype=torch.long).to(self.device)
+            pred = F.softmax(self.model(motif_graph.x, motif_graph.edge_index, batch), dim=1)
+            embedding = self.model(motif_graph.x, motif_graph.edge_index, batch, return_embedding=True)
+            return motif_graph, pred[0, self.label].item(), embedding
+
         while queue:
             node1, node2 = queue.popleft()
-            
-            motif2 = self.id_motif[tree.x[node2].item()]
-            motif2 = sanitize_mol(get_mol(motif2, self.data_name), self.add_H)
+
+            motif2_key = self.id_motif[tree.x[node2].item()]
+            motif2_graph = self.motif_data[motif2_key]
             curr_cand = []
 
-            if not curr_mol:
-                motif1 = self.id_motif[tree.x[node1].item()]
-                motif1 = sanitize_mol(get_mol(motif1, self.data_name), self.add_H)
-                # Create a dictionary store the original motif index of each node in motif1
-                atom_motif_id_mapping = {}
-                for atom in motif1.GetAtoms():
-                    atom_motif_id_mapping[atom.GetIdx()] = node1
-
-                num_atoms = len(atom_motif_id_mapping)
-                # Add node in motif2 into atom_motif_id_mapping
-                for atom in motif2.GetAtoms():
-                    atom_motif_id_mapping[atom.GetIdx()+num_atoms] = node2
-
-                atom_pairs = [(i, j) for i in range(motif1.GetNumAtoms()) for j in range(motif2.GetNumAtoms())]
-                for atom1, atom2 in atom_pairs:
-                    for bond_type in bond_types:
-                        cand = self.combine_motifs(motif1, motif2, atom1, atom2, bond_type)
-                        if cand:
-                            curr_cand.append(cand)
+            if curr_graph is None:
+                motif1_key = self.id_motif[tree.x[node1].item()]
+                motif1_graph = self.motif_data[motif1_key]
+                # Initialise mapping: nodes of motif1 then motif2
+                for idx in range(motif1_graph.num_nodes):
+                    node_motif_mapping[idx] = node1
+                offset = motif1_graph.num_nodes
+                for idx in range(motif2_graph.num_nodes):
+                    node_motif_mapping[offset + idx] = node2
+                node_pairs = [
+                    (i, j)
+                    for i in range(motif1_graph.num_nodes)
+                    for j in range(motif2_graph.num_nodes)
+                ]
+                for n1_idx, n2_idx in node_pairs:
+                    curr_cand.append(self.combine_motifs(
+                        motif1_graph.to(self.device), motif2_graph.to(self.device), n1_idx, n2_idx
+                    ))
             else:
-                atom_in_motif1 = []
-                num_atoms = len(atom_motif_id_mapping)
-                # Add node in motif2 into atom_motif_id_mapping
-                for atom in motif2.GetAtoms():
-                    atom_motif_id_mapping[atom.GetIdx()+num_atoms] = node2
-                
-                for key, value in atom_motif_id_mapping.items():
-                    if value == node1:
-                        atom_in_motif1.append(key)
+                offset = len(node_motif_mapping)
+                for idx in range(motif2_graph.num_nodes):
+                    node_motif_mapping[offset + idx] = node2
+                nodes_in_motif1 = [k for k, v in node_motif_mapping.items() if v == node1 and k < offset]
+                node_pairs = [
+                    (i, j)
+                    for i in nodes_in_motif1
+                    for j in range(motif2_graph.num_nodes)
+                ]
+                for n1_idx, n2_idx in node_pairs:
+                    curr_cand.append(self.combine_motifs(
+                        curr_graph.to(self.device), motif2_graph.to(self.device), n1_idx, n2_idx
+                    ))
 
-                atom_pairs = [(atom_in_motif1[i], j) for i in range(len(atom_in_motif1)) for j in range(motif2.GetNumAtoms())]
-                for atom1, atom2 in atom_pairs:
-                    for bond_type in bond_types:
-                        cand = self.combine_motifs(curr_mol, motif2, atom1, atom2, bond_type)
-                        if cand:
-                            curr_cand.append(cand)
             if not curr_cand:
                 break
             max_score = 0.0
-
             for cand in curr_cand:
-                data = to_tudataset(cand, self.data_name)
-                data.to(self.device)
-                batch = torch.zeros(data.num_nodes, dtype=torch.long).to(self.device)
-                pred = self.model(data.x, data.edge_index, batch)
-                # softmax pred and get the probability of the label
-                pred = F.softmax(pred, dim=1)
+                cand = cand.to(self.device)
+                batch = torch.zeros(cand.num_nodes, dtype=torch.long).to(self.device)
+                pred = F.softmax(self.model(cand.x, cand.edge_index, batch), dim=1)
                 if pred[0, self.label] > max_score:
                     max_score = pred[0, self.label]
-                    curr_mol = cand
+                    curr_graph = cand
 
             visited.add(node1)
             visited.add(node2)
-        try:
-            smiles = sanitize_smiles(get_smiles(curr_mol), self.add_H)
-        except:
 
+        if curr_graph is None:
             return None, 0, None
-        # smiles = sanitize_smiles(get_smiles(curr_mol), self.add_H)
-        data = to_tudataset(curr_mol, self.data_name)
-        data.to(self.device)
-        batch = torch.zeros(data.num_nodes, dtype=torch.long).to(self.device)
-        pred = self.model(data.x, data.edge_index, batch)
-        pred = F.softmax(pred, dim=1)
-        embedding = self.model(data.x, data.edge_index, batch, return_embedding=True)
-
-        return smiles, pred[0, self.label].item(), embedding
+        curr_graph = curr_graph.to(self.device)
+        batch = torch.zeros(curr_graph.num_nodes, dtype=torch.long).to(self.device)
+        pred = F.softmax(self.model(curr_graph.x, curr_graph.edge_index, batch), dim=1)
+        embedding = self.model(curr_graph.x, curr_graph.edge_index, batch, return_embedding=True)
+        return curr_graph, pred[0, self.label].item(), embedding
     
-    def combine_motifs(self, motif1, motif2, atom_idx1, atom_idx2, bond_type):
-        combined_mol = Chem.CombineMols(motif1, motif2)
-        editable_mol = Chem.EditableMol(combined_mol)
-        
-        # Add a bond between specified atom indices from each molecule
-        num_atoms1 = motif1.GetNumAtoms()
-        editable_mol.AddBond(atom_idx1, num_atoms1 + atom_idx2, bond_type)
-        
-        # Attempt to sanitize the molecule, returns None if unsuccessful
-        new_mol = editable_mol.GetMol()
-
-        return sanitize_mol(new_mol, self.add_H)
+    def combine_motifs(self, graph1, graph2, node_idx1, node_idx2):
+        """Combine two PyG Data graphs by concatenating their nodes/edges and
+        adding a bidirectional edge between node_idx1 in graph1 and
+        node_idx2 in graph2.  Returns a new Data object."""
+        n1 = graph1.x.size(0)
+        combined_x = torch.cat([graph1.x, graph2.x], dim=0)
+        shifted_ei2 = graph2.edge_index + n1 if graph2.edge_index.size(1) > 0 else graph2.edge_index
+        new_edge = torch.tensor(
+            [[node_idx1, n1 + node_idx2], [n1 + node_idx2, node_idx1]],
+            dtype=torch.long, device=graph1.x.device,
+        )
+        parts = [p for p in [graph1.edge_index, shifted_ei2, new_edge] if p.size(1) > 0]
+        combined_ei = torch.cat(parts, dim=1) if parts else torch.empty((2, 0), dtype=torch.long)
+        return Data(x=combined_x, edge_index=combined_ei)
     
     def straight_through_gumbel_softmax(self, logits, temperature=0.5, first_node=False):
         gumbels = -torch.log(-torch.log(torch.rand_like(logits)))
@@ -499,17 +504,21 @@ class MAGE:
         self.first_node_mask = mask.to(self.device)
         # self.mask_pred = mask_pred
 
-        if os.path.exists("checkpoints/motif_selection/"+self.data_name+"_motif_"+str(self.label)+".pt"):
-            selected_motif = torch.load("checkpoints/motif_selection/"+self.data_name+"_motif_"+str(self.label)+".pt")
-        else:
+        ckpt_path = "checkpoints/motif_selection/" + self.data_name + "_motif_" + str(self.label) + ".pt"
+        if os.path.exists(ckpt_path):
+            selected_motif = torch.load(ckpt_path)
+        elif self.smiles_set is not None:
+            # motif_filter requires a molecular smiles_set; skip for non-molecular datasets
             motif_filter(self.whole_dataset, self.data_name, self.smiles_set, self.model, 2, self.device)
-            selected_motif = torch.load("checkpoints/motif_selection/"+self.data_name+"_motif_"+str(self.label)+".pt")
+            selected_motif = torch.load(ckpt_path)
+        else:
+            # No molecular smiles_set provided: allow all motifs
+            selected_motif = list(self.motif_id.keys())
 
         mask = torch.zeros((1, len(self.motif_id)), dtype=torch.long).to(self.device)
-
-        for i, smiles in enumerate(self.motif_id.keys()):
-            if smiles in selected_motif:
-                mask[0][self.motif_id[smiles]] = 1
+        for i, motif_key in enumerate(self.motif_id.keys()):
+            if motif_key in selected_motif:
+                mask[0][self.motif_id[motif_key]] = 1
         self.motif_mask = mask.bool()
 
 
@@ -574,9 +583,9 @@ class MAGE:
                 # total_graph_pred += graph_pred
                 # total_graph_sample_count += graph_sample_count
             print(f'Epoch {epoch}, Loss: {total_loss}, Topo Loss: {total_topo_loss}, Label Loss: {total_label_loss}, Emb Loss: {total_emb_loss}, Pred Loss: {total_pred_loss}, Acc: {total_acc / total_count}, Acc_count: {total_acc}.')
-            if total_loss < best_loss:
-                best_loss = total_loss
-                self.save(path_dict)
+            #if total_loss < best_loss:
+            best_loss = total_loss
+            self.save(path_dict)
 
     def load(self, path_dict):
         # Load the model from the path
@@ -614,12 +623,9 @@ class MAGE:
         
         node_scores = []
         for motif in self.motif_id.keys():
-            smiles = sanitize_smiles(motif, self.add_H)
-            mol = sanitize_mol(get_mol(smiles, self.data_name), self.add_H)
-            data = to_tudataset(mol, self.data_name)
-            data.to(self.device)
-            batch = torch.zeros(data.num_nodes, dtype=torch.long).to(self.device)
-            pred = self.model(data.x, data.edge_index, batch)
+            motif_graph = self.motif_data[motif].to(self.device)
+            batch = torch.zeros(motif_graph.num_nodes, dtype=torch.long).to(self.device)
+            pred = self.model(motif_graph.x, motif_graph.edge_index, batch)
             pred = F.softmax(pred, dim=1)
             node_scores.append(pred[0, self.label].item())
         self.node_scores = torch.tensor(node_scores).to(self.device)
@@ -642,11 +648,11 @@ class MAGE:
             tree_wrong += acc_wrong
             if len(new_tree.x) == 0:
                 continue
-            smiles, pred_prob, _ = self.decode_graph(new_tree)
+            graph_repr, pred_prob, _ = self.decode_graph(new_tree)
             total_pred_prob.append(pred_prob)
             total_prob += prob
-            output.append(smiles)
-            if not smiles:
+            output.append(graph_repr)
+            if graph_repr is None:
                 count_invalid += 1
         return output, total_pred_prob, count_invalid, total_prob / (tree_correct + tree_wrong)
 

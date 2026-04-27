@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import sys
 from pathlib import Path
 from utils.model import GCN
-from utils.utils import sanitize_smiles, to_smiles
 from torch_geometric.data import DataLoader
 from new_mage import MAGE
 import argparse
@@ -40,7 +39,7 @@ from Utils.datasets import get_dataset
 parser = argparse.ArgumentParser(description='Train target model')
 parser.add_argument('--data_name', type=str, default='Mutagenicity', help='Name of the dataset')
 parser.add_argument('--input_channels', type=int, default=14, help='Number of input channels')
-parser.add_argument('--hidden_channels', type=int, default=64, help='Number of hidden channels')
+parser.add_argument('--hidden_channels', type=int, default=32, help='Number of hidden channels')
 parser.add_argument('--output_channels', type=int, default=2, help='Number of output channels')
 parser.add_argument('--target_model', type=str, default='checkpoints/models/Mutagenicity_model.pth', help='Path to the pretrained GNN model')
 parser.add_argument('--dataset', type=str, default='checkpoints/datasets/Mutagenicity.pt', help='Path to the dataset')
@@ -92,15 +91,9 @@ model.forward = model.forward_mage
 new_dataset = []
 count = 0
 prob = 0
-smiles_set = []
 for data in dataset:
     batch = torch.zeros(data.num_nodes, dtype=torch.long).to(device)
     pred = model(data.x.to(device), data.edge_index.to(device), batch=batch)
-    smiles = to_smiles(data, data_name=args.data_name)
-    smiles = sanitize_smiles(smiles)
-    if not smiles:
-        continue
-    smiles_set.append(smiles)
     if pred.argmax().item() == args.label:
         if pred.softmax(1)[0][args.label].item() > 0.9:
             new_dataset.append(data)
@@ -108,7 +101,7 @@ for data in dataset:
             prob += pred.softmax(1)[0][args.label].item()
 
 # Initialize the Mage class
-mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=smiles_set, data_name=args.data_name, add_H=False, label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
+mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=None, data_name=args.data_name, add_H=False, label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
 #mage = MAGE(gnn=model, model=model, dataset=new_dataset, whole_dataset=dataset, smiles_set=smiles_set, data_name=args.data_name, #add_H=False, 
 #            label=args.label, hidden_channels=args.hidden_channels, output_channels=args.output_channels, device=device)
 
@@ -129,45 +122,34 @@ mean = np.mean(pred_prob)
 std = np.std(pred_prob)
 
 #============================================================================
-SMILES_path = f'sampled_data/{args.data_name}_label_{args.label}_SMILES.txt'
-os.makedirs(os.path.dirname(SMILES_path), exist_ok=True)
-
-with open(SMILES_path, 'w') as f:
-    for data in sampled_data:
-        f.write(f'{data}\n')
+graph_path = f'sampled_data/treex_{args.data_name}_label_{args.label}_graphs.pt'
+os.makedirs(os.path.dirname(graph_path), exist_ok=True)
+torch.save(sampled_data, graph_path)
 
 prob_path = f'sampled_data/treex_{args.data_name}_label_{args.label}_prob.txt'
-os.makedirs(os.path.dirname(SMILES_path), exist_ok= True)
+os.makedirs(os.path.dirname(prob_path), exist_ok=True)
 
 with open(prob_path, 'w') as f:
     for data in pred_prob:
         f.write(f'{data}\n')
 
-
-from graph_draw import smiles_to_graph
-
-graphs = []
-index = 0
-for data in sampled_data:
-    graph = smiles_to_graph(data)
-    #print(graph.nodes(data=True))
-    #print(graph.edges(data=True))
-    graphs.append(graph)
-
-    if graph is None:
-        continue
-
-    graph_path = f"sampled_data/graphs/treex_{args.data_name}_label_{args.label}_graph_{index}.png"
-
-    os.makedirs(os.path.dirname(graph_path), exist_ok=True)
-
-    # save image
-    plt.savefig(graph_path, bbox_inches="tight")
-    plt.close()
-
-    index +=1
-
-    if index == 20:
-        break
+# Draw sampled graphs using pygraphviz
+graphs_dir = f'sampled_data/graphs/treex_{args.data_name}_label_{args.label}'
+os.makedirs(graphs_dir, exist_ok=True)
+n_to_plot = min(10, len(sampled_data))
+for i, graph_data in enumerate(sampled_data[:n_to_plot]):
+    G = to_networkx(graph_data, to_undirected=True)
+    if graph_data.x is not None:
+        labels = {n: str(graph_data.x[n].argmax().item()) for n in G.nodes()}
+    else:
+        labels = {n: str(n) for n in G.nodes()}
+    A = nx.nx_agraph.to_agraph(G)
+    for node in A.nodes():
+        node.attr['label'] = labels[int(str(node))]
+        node.attr['shape'] = 'circle'
+    A.graph_attr.update(rankdir='LR')
+    A.layout('dot')
+    A.draw(f'{graphs_dir}/graph_{i}.png', prog='dot')
+print(f'Saved {n_to_plot} graph images to {graphs_dir}/')
 
 #============================================================================================
