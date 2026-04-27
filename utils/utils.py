@@ -175,6 +175,7 @@ def to_tudataset(mol, data_name, label=None):
     swapped_edge_feature_map = {value: key for key, value in EDGE[data_name].items()}
     for bond in mol.GetBonds():
         bond_type = bond.GetBondTypeAsDouble()
+        #print("bond type:", bond_type)
         if bond_type == 1.0:
             bond_feat = swapped_edge_feature_map[rdchem.BondType.SINGLE]
         elif bond_type == 1.5:
@@ -184,7 +185,8 @@ def to_tudataset(mol, data_name, label=None):
         elif bond_type == 3.0:
             bond_feat = swapped_edge_feature_map[rdchem.BondType.TRIPLE]
         else:
-            bond_type = swapped_edge_feature_map[None]
+            #bond_type = swapped_edge_feature_map[None]
+            bond_feat = swapped_edge_feature_map[rdchem.BondType.SINGLE]
 
         bond_features.append(bond_feat)
         bond_features.append(bond_feat)
